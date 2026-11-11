@@ -24,9 +24,21 @@ Design notes
   * Parallelise with a multi-process ``Collector`` (one env per worker), not
     ``ParallelEnv``, which syncs every step and was slower than one process.
 
-Not done yet: player-to-player trading (extend ``CatanCore._build_action_table``,
-mask unaffordable offers, cap offers per turn, add the offer to observations)
-and reward shaping (write a ``RewardFn`` like ``WinLossReward``).
+Player-to-player trading (``CatanConfig(trading=True)``, off by default)
+  * Offers: give 1 or 2 of one resource for 1 of another (40 offers). An offer is
+    legal only on your own turn after rolling, only if you hold the cards (the
+    engine does not check this), only if some opponent holds the asked card (no
+    offers that nobody can accept; this tells the offerer "someone has ore" and
+    nothing more), and at most ``max_offers_per_turn`` times per turn (0 = no
+    offers: learn the base game first, then raise it without changing shapes).
+  * Responses: each opponent who holds the asked card, in seat order, accepts or
+    rejects; the others are skipped, so nobody is asked a question with only one
+    answer. If anyone accepted, the offerer confirms with one of them (relative
+    seat, like the robber) or cancels. While a trade is being answered, the
+    player being asked is the active agent.
+  * Observations get extra trade features (offer, who made it, who accepted).
+  * With trading off, actions and observations are exactly as before, so older
+    checkpoints still load.
 
 Run ``python catan_env.py --workers 4`` to print the specs and benchmark speed.
 """
@@ -48,11 +60,11 @@ from torchrl.envs import EnvBase
 from catanatron.features import create_sample, get_feature_ordering
 from catanatron.game import Game
 from catanatron.gym.envs.action_space import get_action_array
-from catanatron.models.enums import Action, ActionType
+from catanatron.models.enums import RESOURCES, Action, ActionPrompt, ActionType
 from catanatron.models.map import build_map
 from catanatron.models.player import Color, Player
 from catanatron.observer import GameObserver
-from catanatron.state_functions import get_visible_victory_points
+from catanatron.state_functions import get_player_freqdeck, get_visible_victory_points, player_has_rolled
 
 GROUP = "agents"
 OBS = (GROUP, "observation")
@@ -76,12 +88,32 @@ class CatanConfig:
     vps_to_win: int = 8
     turn_limit: int = 1000  # no winner after this many turns -> truncated
     dev_cards: bool = False
+    trading: bool = False  # player-to-player trades
+    max_offers_per_turn: int = 1  # only used when trading=True; 0 = nobody may offer
 
     def __post_init__(self):
         if not 2 <= self.num_players <= 4:
             raise ValueError("num_players must be 2, 3 or 4")
         if self.map_type not in ("MINI", "BASE", "TOURNAMENT"):
             raise ValueError(f"unknown map_type {self.map_type!r}")
+        if self.max_offers_per_turn < 0:
+            raise ValueError("max_offers_per_turn must be 0 or more")
+
+
+def trade_offers() -> list[tuple]:
+    """The offers agents can make, in Catanatron's format: 5 counts given, then 5 asked
+    (wood, brick, sheep, wheat, ore). Give 1 or 2 of one resource for 1 of another."""
+    offers = []
+    for give in range(5):
+        for ask in range(5):
+            if give == ask:
+                continue
+            for n_give in (1, 2):
+                value = [0] * 10
+                value[give] = n_give
+                value[5 + ask] = 1
+                offers.append(tuple(value))
+    return offers
 
 
 # ----------------------------------------------------------------- rewards
@@ -117,14 +149,36 @@ class CatanCore:
         self.action_table = self._build_action_table()
         self._action_index = {a: i for i, a in enumerate(self.action_table)}
         self.n_actions = len(self.action_table)
-        self.feature_names = list(get_feature_ordering(self.n_agents, config.map_type))
+        base_features = list(get_feature_ordering(self.n_agents, config.map_type))
+        self._pick_features = operator.itemgetter(*base_features)
+        self.feature_names = base_features + (self._trade_feature_names() if config.trading else [])
         self.obs_dim = len(self.feature_names)
-        self._pick_features = operator.itemgetter(*self.feature_names)
+        if config.trading:
+            offers = [(i, v) for i, (t, v) in enumerate(self.action_table) if t == ActionType.OFFER_TRADE]
+            self._offer_indices = np.array([i for i, _ in offers])
+            self._offer_gives = np.array([v[:5] for _, v in offers])  # [n_offers, 5]
+            self._offer_asks = np.array([v[5:].index(1) for _, v in offers])  # [n_offers] asked resource
 
     def _build_action_table(self) -> list[tuple]:
-        # Catanatron's Gym action list. Robber victims use self.colors as stand-ins
-        # for "me, next player, ...". Trade actions get appended here later.
-        return list(get_action_array(self.colors, self.config.map_type))
+        # Catanatron's Gym action list. Robber victims (and trade partners) use
+        # self.colors as stand-ins for "me, next player, ...".
+        table = list(get_action_array(self.colors, self.config.map_type))
+        if self.config.trading:
+            table += [(ActionType.OFFER_TRADE, offer) for offer in trade_offers()]
+            # Accept/reject carry the whole offer in Catanatron; here one index each.
+            table += [(ActionType.ACCEPT_TRADE, None), (ActionType.REJECT_TRADE, None),
+                      (ActionType.CANCEL_TRADE, None)]
+            # "Confirm with the player k seats after me", k = 1 .. n-1.
+            table += [(ActionType.CONFIRM_TRADE, self.colors[k]) for k in range(1, self.n_agents)]
+        return table
+
+    def _trade_feature_names(self) -> list[str]:
+        names = ["TRADE_IN_PROGRESS", "TRADE_I_AM_ASKED", "TRADE_I_CHOOSE_PARTNER"]
+        names += [f"TRADE_OFFER_GIVES_{r}" for r in RESOURCES]  # from the offerer's side
+        names += [f"TRADE_OFFER_ASKS_{r}" for r in RESOURCES]
+        names += [f"TRADE_OFFERER_P{k}" for k in range(self.n_agents)]  # P0 = me, P1 = next, ...
+        names += [f"TRADE_ACCEPTED_P{k}" for k in range(self.n_agents)]
+        return names
 
     def new_game(self, seed: Optional[int] = None, players: Optional[list] = None) -> Game:
         """Same seed -> same map, turn order and dice. `players` only for bot matches."""
@@ -157,35 +211,97 @@ class CatanCore:
         return self.reward_fn(self, game)
 
     def observation(self, game: Game, agent: int) -> np.ndarray:
-        """Catanatron's features from this agent's point of view (opponents' hands hidden)."""
-        return np.array(self._pick_features(create_sample(game, self.colors[agent])), dtype=np.float32)
+        """Catanatron's features from this agent's point of view (opponents' hands hidden),
+        plus trade features when trading is on."""
+        base = np.array(self._pick_features(create_sample(game, self.colors[agent])), dtype=np.float32)
+        if not self.config.trading:
+            return base
+        return np.concatenate([base, self._trade_features(game, agent)])
+
+    def _trade_features(self, game: Game, agent: int) -> np.ndarray:
+        state, me, n = game.state, self.colors[agent], self.n_agents
+        f = np.zeros(13 + 2 * n, dtype=np.float32)
+        if not state.is_resolving_trade:
+            return f
+        asking_me = state.current_color() == me
+        f[0] = 1.0
+        f[1] = state.current_prompt == ActionPrompt.DECIDE_TRADE and asking_me
+        f[2] = state.current_prompt == ActionPrompt.DECIDE_ACCEPTEES and asking_me
+        f[3:13] = state.current_trade[:10]
+        offerer = state.colors[state.current_turn_index]
+        f[13 + self._relative(game, me, offerer)] = 1.0
+        for color, accepted in zip(state.colors, state.acceptees):
+            if accepted:
+                f[13 + n + self._relative(game, me, color)] = 1.0
+        return f
 
     def legal_action_mask(self, game: Game, agent: int) -> np.ndarray:
         """Legal moves for `agent`; all False if it isn't their turn."""
         mask = np.zeros(self.n_actions, dtype=bool)
-        if not self.is_over(game) and self.current_agent(game) == agent:
-            for action in game.playable_actions:
-                mask[self.action_to_index(game, action)] = True
+        if self.is_over(game) or self.current_agent(game) != agent:
+            return mask
+        for action in game.playable_actions:
+            mask[self.action_to_index(game, action)] = True
+        if self.config.trading and self._can_offer(game):
+            state, me = game.state, self.colors[agent]
+            hand = np.array(get_player_freqdeck(state, me))
+            others = np.array([get_player_freqdeck(state, c) for c in self.colors if c != me])
+            mask[self._offer_indices] = ((hand >= self._offer_gives).all(axis=1)  # I hold what I give
+                                         & others.any(axis=0)[self._offer_asks])  # someone holds what I ask
         return mask
+
+    def _can_offer(self, game: Game) -> bool:
+        state = game.state
+        return (state.current_prompt == ActionPrompt.PLAY_TURN
+                and not state.is_resolving_trade
+                and player_has_rolled(state, state.current_color())
+                and self.offers_this_turn(game) < self.config.max_offers_per_turn)
+
+    def offers_this_turn(self, game: Game) -> int:
+        """Offers the current turn's player has made since rolling the dice this turn."""
+        color = game.state.colors[game.state.current_turn_index]
+        count = 0
+        for record in reversed(game.state.action_records):
+            action = record.action
+            if action.color == color and action.action_type == ActionType.ROLL:
+                break
+            if action.color == color and action.action_type == ActionType.OFFER_TRADE:
+                count += 1
+        return count
 
     def legal_indices(self, game: Game) -> np.ndarray:
         return np.flatnonzero(self.legal_action_mask(game, self.current_agent(game)))
 
+    def _relative(self, game: Game, actor: Color, other: Color) -> int:
+        order = game.state.colors  # turn order
+        return (order.index(other) - order.index(actor)) % self.n_agents
+
+    def _absolute(self, game: Game, actor: Color, rel: int) -> Color:
+        order = game.state.colors
+        return order[(order.index(actor) + rel) % self.n_agents]
+
     def action_to_index(self, game: Game, action: Action) -> int:
-        value = action.value
-        if action.action_type == ActionType.MOVE_ROBBER and value[1] is not None:
-            order = game.state.colors  # turn order
-            rel = (order.index(value[1]) - order.index(action.color)) % self.n_agents
-            value = (value[0], self.colors[rel])
-        return self._action_index[(action.action_type, value)]
+        action_type, value = action.action_type, action.value
+        if action_type == ActionType.MOVE_ROBBER and value[1] is not None:
+            value = (value[0], self.colors[self._relative(game, action.color, value[1])])
+        elif action_type in (ActionType.ACCEPT_TRADE, ActionType.REJECT_TRADE):
+            value = None
+        elif action_type == ActionType.CONFIRM_TRADE:
+            value = self.colors[self._relative(game, action.color, value[10])]
+        elif action_type == ActionType.OFFER_TRADE:
+            value = tuple(value[:10])
+        return self._action_index[(action_type, value)]
 
     def index_to_action(self, game: Game, index: int, agent: int) -> Action:
         actor = self.colors[agent]
         action_type, value = self.action_table[index]
         if action_type == ActionType.MOVE_ROBBER and value[1] is not None:
-            order = game.state.colors
-            rel = self.colors.index(value[1])
-            value = (value[0], order[(order.index(actor) + rel) % self.n_agents])
+            value = (value[0], self._absolute(game, actor, self.colors.index(value[1])))
+        elif action_type in (ActionType.ACCEPT_TRADE, ActionType.REJECT_TRADE):
+            value = game.state.current_trade
+        elif action_type == ActionType.CONFIRM_TRADE:
+            partner = self._absolute(game, actor, self.colors.index(value))
+            value = (*game.state.current_trade[:10], partner)
         return Action(actor, action_type, value)
 
     def apply(self, game: Game, agent: int, index: int, observers: Iterable = ()) -> Action:
@@ -197,12 +313,26 @@ class CatanCore:
         if not 0 <= index < self.n_actions:
             raise IllegalActionError(f"action index {index} out of range")
         action = self.index_to_action(game, index, agent)
-        if action not in game.playable_actions:
+        if not self.legal_action_mask(game, agent)[index]:  # covers offers, which the engine doesn't list
             raise IllegalActionError(f"{action} is not legal right now")
         for observer in observers:
             observer.step(game, action)  # observers see the game before the action
         game.execute(action)
+        self.skip_forced_rejects(game)
         return action
+
+    @staticmethod
+    def skip_forced_rejects(game: Game) -> None:
+        """Answer "reject" for players who have no real choice, so the question moves on:
+          * players who don't hold the asked cards (reject is their only legal move), and
+          * the offerer: a Catanatron bug asks them about their own offer whenever they
+            don't sit first.
+        No-op when trading is off."""
+        state = game.state
+        while (state.is_resolving_trade and state.current_prompt == ActionPrompt.DECIDE_TRADE
+               and (len(game.playable_actions) == 1
+                    or state.current_color() == state.colors[state.current_turn_index])):
+            game.execute(Action(state.current_color(), ActionType.REJECT_TRADE, state.current_trade))
 
 
 # ------------------------------------------------------------------- stats
@@ -243,6 +373,48 @@ class RobberStats(GameObserver):
         return {color.value: dict(record) for color, record in self.by_color.items()}
 
 
+class TradeStats(GameObserver):
+    """Trading activity per color for one game (all zeros when trading is off).
+
+      offers              offers this player made
+      accepts / rejects   how this player answered offers it could have accepted
+      cancels             offers this player called off after someone accepted
+      trades              completed trades (counted for both sides)
+      trades_with_leader  completed trades whose partner was this player's single clear
+                          leader (most visible VPs among its opponents) at that moment
+    """
+
+    FIELDS = ("offers", "accepts", "rejects", "cancels", "trades", "trades_with_leader")
+
+    def __init__(self, *args, **kwargs):
+        self.by_color = defaultdict(lambda: dict.fromkeys(self.FIELDS, 0))
+
+    def before(self, game):
+        self.by_color.clear()
+
+    def step(self, game, action):
+        field = {
+            ActionType.OFFER_TRADE: "offers", 
+            ActionType.ACCEPT_TRADE: "accepts",
+            ActionType.REJECT_TRADE: "rejects", 
+            ActionType.CANCEL_TRADE: "cancels"
+        }.get(action.action_type)
+
+        if field:
+            self.by_color[action.color][field] += 1
+        elif action.action_type == ActionType.CONFIRM_TRADE:
+            partner = action.value[10]
+            for me, other in ((action.color, partner), (partner, action.color)):
+                self.by_color[me]["trades"] += 1
+                vps = {c: get_visible_victory_points(game.state, c) for c in game.state.colors if c != me}
+                leaders = [c for c, v in vps.items() if v == max(vps.values())]
+                if leaders == [other]:
+                    self.by_color[me]["trades_with_leader"] += 1
+
+    def summary(self) -> dict:
+        return { color.value: dict(record) for color, record in self.by_color.items() }
+
+
 # --------------------------------------------------------------------- env
 class CatanEnv(EnvBase):
     def __init__(self, config: CatanConfig = CatanConfig(), reward_fn: Optional[RewardFn] = None,
@@ -258,6 +430,8 @@ class CatanEnv(EnvBase):
         self.last_game_seed: Optional[int] = None
         self.stats = RobberStats()
         self.last_episode_stats: dict = {}
+        self.trade_stats = TradeStats()
+        self.last_episode_trade_stats: dict = {}
         self._make_specs()
 
     def _make_specs(self):
@@ -309,14 +483,16 @@ class CatanEnv(EnvBase):
         self.last_game_seed = int(self._rng.integers(2**31 - 1))
         self.game = self.core.new_game(self.last_game_seed)
         self.stats.before(self.game)
+        self.trade_stats.before(self.game)
         return self._observe(False, False)
 
     def _step(self, tensordict: TensorDictBase) -> TensorDict:
         agent = self.core.current_agent(self.game)
-        self.core.apply(self.game, agent, int(tensordict.get(ACTION)[agent]), observers=(self.stats,))
+        self.core.apply(self.game, agent, int(tensordict.get(ACTION)[agent]), observers=(self.stats, self.trade_stats))
         terminated, truncated = self.core.status(self.game)
         if terminated or truncated:
             self.last_episode_stats = self.stats.summary()
+            self.last_episode_trade_stats = self.trade_stats.summary()
         out = self._observe(terminated, truncated)
         out.set(REWARD, torch.from_numpy(self.core.rewards(self.game)).unsqueeze(-1).to(self.device))
         return out
