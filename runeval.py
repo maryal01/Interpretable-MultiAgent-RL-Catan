@@ -1,4 +1,5 @@
 import argparse
+import dataclasses
 import itertools
 import torch
 from torchrl.modules import MultiAgentMLP
@@ -19,7 +20,11 @@ def load_policy_net(path, core):
         activation_class=torch.nn.Tanh,
     )
     ckpt = torch.load(path, map_location="cpu")
-    net.load_state_dict(ckpt["policy"])
+    try:
+        net.load_state_dict(ckpt["policy"])
+    except (RuntimeError, ValueError) as e:
+        raise SystemExit(f"{path} does not fit a network with {core.obs_dim} inputs and {core.n_actions} actions. "
+                         "Pass --trading if (and only if) it was trained with trading=True.") from e
     net.eval()
     return net, ckpt["iteration"]
 
@@ -28,9 +33,13 @@ def main():
     parser.add_argument("checkpoint")
     parser.add_argument("--games", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
+    # These two must match the CatanConfig the checkpoint was trained with.
+    parser.add_argument("--trading", action="store_true")
+    parser.add_argument("--max-offers", type=int, default=CONFIG.max_offers_per_turn)
     args = parser.parse_args()
 
-    core = CatanCore(CONFIG)
+    config = dataclasses.replace(CONFIG, trading=args.trading, max_offers_per_turn=args.max_offers)
+    core = CatanCore(config)
     n = core.n_agents
     net, iteration = load_policy_net(args.checkpoint, core)
     print(f"{args.checkpoint} (iteration {iteration}), {args.games} games per match")
@@ -39,7 +48,7 @@ def main():
     for k in range(n):
         seats = ["random"] * n
         seats[k] = make_policy(net, k, n)
-        r = play_match(seats, args.games, CONFIG, seed=args.seed)
+        r = play_match(seats, args.games, config, seed=args.seed)
         bots = sum(r.win_rates[i] for i in range(n) if i != k)
         print(f"   network {k}: win rate {r.win_rates[k]:.2f} , three bots together {bots:.2f}")
 
@@ -47,7 +56,7 @@ def main():
     for a, b in itertools.combinations(range(n), 2):
         seats = ["random"] * n
         seats[a], seats[b] = make_policy(net, a, n), make_policy(net, b, n)
-        r = play_match(seats, args.games, CONFIG, seed=args.seed)
+        r = play_match(seats, args.games, config, seed=args.seed)
         bots = sum(r.win_rates[i] for i in range(n) if i not in (a, b))
         print(f"   network {a} {r.win_rates[a]:.2f}, network {b} {r.win_rates[b]:.2f}, both bots together {bots:.2f}")
 

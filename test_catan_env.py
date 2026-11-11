@@ -160,6 +160,12 @@ def test_play_match(n):
         assert r["steals_from_leader"] <= r["clear_leader_steals"] <= r["steals"]
 
 
+def test_play_match_with_trading():
+    seats = [random_policy(0), random_policy(1), "random", "random"]  # policies offer, policies and bots answer
+    result = play_match(seats, n_games=2, config=CatanConfig(trading=True))
+    assert result.wins.sum() + result.truncated == 2
+
+
 def test_illegal_policy_is_caught():
     with pytest.raises(IllegalActionError):
         play_match([lambda obs, mask: int((~mask).nonzero()[0][0])] + ["random"] * 3, n_games=1)

@@ -5,6 +5,10 @@
 A policy is any function  policy(obs [D], legal_mask [A]) -> action index,
 using the same observations and action indices as CatanEnv. Wrap a trained
 network in one to evaluate it. With n players, chance win rate is 1/n.
+
+With CatanConfig(trading=True) policies can offer trades. Catanatron's bots never
+offer. Asked about an offer they could accept, random / weighted / victory_point
+say yes about half the time, value always says no, and alphabeta cannot answer.
 """
 
 from __future__ import annotations
@@ -48,8 +52,9 @@ class PolicyPlayer(Player):
     def decide(self, game, playable_actions):
         obs = self.core.observation(game, self.agent)
         mask = self.core.legal_action_mask(game, self.agent)
-        action = self.core.index_to_action(game, int(self.policy(obs, mask)), self.agent)
-        if action not in playable_actions:
+        index = int(self.policy(obs, mask))
+        action = self.core.index_to_action(game, index, self.agent)
+        if not mask[index]:  # the mask, not playable_actions: the engine never lists trade offers
             raise IllegalActionError(f"policy chose {action}, which is not legal")
         return action
 
@@ -87,6 +92,8 @@ def play_match(seats: Sequence, n_games: int = 100, config: CatanConfig = CatanC
     for s in seats:
         if isinstance(s, str) and s not in BOTS:
             raise ValueError(f"unknown bot {s!r}; choose from {sorted(BOTS)}")
+    if config.trading and "alphabeta" in seats:
+        raise ValueError("alphabeta cannot answer trade offers; choose another bot when trading is on")
     labels = list(labels or [s if isinstance(s, str) else f"policy_{i}" for i, s in enumerate(seats)])
 
     wins, final_vps = np.zeros(n, dtype=int), np.zeros(n)
@@ -99,6 +106,7 @@ def play_match(seats: Sequence, n_games: int = 100, config: CatanConfig = CatanC
         game.watch(stats)
         while not core.is_over(game):
             game.play_tick()
+            core.skip_forced_rejects(game)  # trade offers are answered as in training
         winner = game.winning_color()
         if winner is None:
             truncated += 1
@@ -131,9 +139,10 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--map", default="BASE", choices=["MINI", "BASE", "TOURNAMENT"])
     parser.add_argument("--vps", type=int, default=8)
+    parser.add_argument("--trading", action="store_true")
     args = parser.parse_args()
 
-    config = CatanConfig(num_players=1 + len(args.opponents), map_type=args.map, vps_to_win=args.vps)
+    config = CatanConfig(num_players=1 + len(args.opponents), map_type=args.map, vps_to_win=args.vps, trading=args.trading)
     policy = random_policy(args.seed)  # TODO: replace with your trained policy
     print(play_match([policy, *args.opponents], args.games, config, args.seed,
                      labels=["our policy", *args.opponents]).table())
