@@ -62,7 +62,8 @@ def train():
         CatanConfig(
             num_players = 4,
             map_type = "BASE",
-            vps_to_win = 8),
+            vps_to_win = 8,
+            trading = True),
         seed = 0,
         device = device,
         reward_fn = InitialRewardFunction())
