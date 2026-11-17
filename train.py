@@ -66,7 +66,7 @@ def train():
             trading = True),
         seed = 0,
         device = device,
-        reward_fn = InitialRewardFunction())
+        reward_fn = InitialRewardFunction(trade_weight = 0.02))  # 0 = no reward for trades
     check_env_specs(env)
 
     env = TransformedEnv(

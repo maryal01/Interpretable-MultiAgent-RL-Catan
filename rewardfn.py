@@ -1,12 +1,62 @@
 import numpy as np
 from collections import defaultdict
-from catanatron.state_functions import get_actual_victory_points
+from catanatron.models.decks import CITY_COST_FREQDECK, ROAD_COST_FREQDECK, SETTLEMENT_COST_FREQDECK
+from catanatron.models.enums import SETTLEMENT, ActionType
+from catanatron.state_functions import get_actual_victory_points, get_player_buildings, get_player_freqdeck, player_key
+
+BUILDS = {
+    "settlement": (np.array(SETTLEMENT_COST_FREQDECK), 1.0),
+    "city": (np.array(CITY_COST_FREQDECK), 1.0),
+    "road": (np.array(ROAD_COST_FREQDECK), 0.25)
+}
+
+def build_limits(game, color):
+    key = player_key(game.state, color)
+    pieces = lambda piece: game.state.player_state[f"{key}_{piece}_AVAILABLE"]
+    return {
+        "settlement": min(pieces("SETTLEMENTS"), len(game.state.board.buildable_node_ids(color))),
+        "city": min(pieces("CITIES"), len(get_player_buildings(game.state, color, SETTLEMENT))),
+        "road": min(pieces("ROADS"), len(game.state.board.buildable_edges(color))),
+    }
+
+def hand_utility(hand, limits, seven_penalty=0.0):
+    left, utility = np.array(hand), 0.0
+    for build, (cost, value) in BUILDS.items():
+        count = min(limits[build], min(left[cost > 0] // cost[cost > 0]))
+        left = left - count * cost
+        utility += count * value
+    
+    partial = 0.0
+    for build, (cost, value) in BUILDS.items():
+        if limits[build]:
+            covered = np.minimum(left, cost).sum() / cost.sum()
+            partial = max(partial, value * covered)
+    utility += partial
+
+    if sum(hand) > 7:
+        utility -= seven_penalty * (sum(hand) // 2) / 6
+    return float(utility)
+
+def trade_gains(game, action, seven_penalty=0.0):
+    gives, asks, partner = np.array(action.value[:5]), np.array(action.value[5:10]), action.value[10]
+    gains = {}
+    for color, received in ((action.color, asks - gives), (partner, gives - asks)):
+        after = np.array(get_player_freqdeck(game.state, color))
+        limits = build_limits(game, color)
+        after_trade = hand_utility(after, limits, seven_penalty)
+        before_trade = hand_utility(after - received, limits, seven_penalty)
+
+        gains[color] = after_trade - before_trade
+    return gains
+
 
 class InitialRewardFunction:
-    def __init__(self, vp_weight = 0.1, win = 1, loss = -1):
+    def __init__(self, vp_weight = 0.1, win = 1, loss = -1, trade_weight = 0.0, seven_penalty = 0.0):
         self.vp_weight = vp_weight
         self.loss_reward = loss
         self.win_reward = win
+        self.trade_weight = trade_weight
+        self.seven_penalty = seven_penalty
 
     def reset(self, core, game):
         self.prev_vp = defaultdict(float)
@@ -18,6 +68,12 @@ class InitialRewardFunction:
             current = get_actual_victory_points(game.state, color)
             rewards[i] = self.vp_weight * (current - self.prev_vp[color])
             self.prev_vp[color] = current
+
+        if self.trade_weight and game.state.action_records:
+            action = game.state.action_records[-1].action
+            if action.action_type == ActionType.CONFIRM_TRADE:
+                for color, gain in trade_gains(game, action, self.seven_penalty).items():
+                    rewards[core.colors.index(color)] += self.trade_weight * gain
 
         winner = game.winning_color()
         if winner is not None:

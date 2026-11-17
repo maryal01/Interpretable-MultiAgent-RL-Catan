@@ -11,6 +11,7 @@ from catanatron.models.enums import ActionType
 from catan_env import (ACTION, ACTION_MASK, ACTIVE, OBS, REWARD, CatanConfig, CatanCore, IllegalActionError,
                        _masked_random_policy, make_env)
 from evaluate import play_match, random_policy
+from rewardfn import InitialRewardFunction
 
 CONFIGS = [CatanConfig(num_players=3), CatanConfig(num_players=4), CatanConfig(num_players=4, map_type="BASE",
                                                                                 vps_to_win=10, turn_limit=1000)]
@@ -164,8 +165,30 @@ def test_play_match_with_trading():
     seats = [random_policy(0), random_policy(1), "random", "random"]  # policies offer, policies and bots answer
     result = play_match(seats, n_games=2, config=CatanConfig(trading=True))
     assert result.wins.sum() + result.truncated == 2
+    assert sum(t["offers"] for t in result.trade) > 0 and "yes if good" in result.table()
+    for t in result.trade:
+        assert t["helped"] + t["hurt"] <= t["trades"] and t["built_after"] <= t["trades"]
+        assert t["yes_good"] <= t["asked_good"] and t["asked_good"] + t["asked_bad"] <= t["accepts"] + t["rejects"]
 
 
 def test_illegal_policy_is_caught():
     with pytest.raises(IllegalActionError):
         play_match([lambda obs, mask: int((~mask).nonzero()[0][0])] + ["random"] * 3, n_games=1)
+
+
+# ------------------------------------------------------------------ reward
+def test_trade_reward_only_pays_the_two_traders():
+    reward_fn = InitialRewardFunction(vp_weight=0, win=0, loss=0, trade_weight=1.0)  # trade part only
+    core = CatanCore(CatanConfig(trading=True), reward_fn=reward_fn)
+    rng, game, trades = np.random.default_rng(0), core.new_game(0), 0
+    while not core.is_over(game):
+        action = core.apply(game, core.current_agent(game), int(rng.choice(core.legal_indices(game))))
+        rewards = core.rewards(game)
+        if action.action_type == ActionType.CONFIRM_TRADE:
+            traders = [core.colors.index(c) for c in (action.color, action.value[10])]
+            others = [i for i in range(core.n_agents) if i not in traders]
+            assert not rewards[others].any()
+            trades += 1
+        else:
+            assert not rewards.any()
+    assert trades > 0
