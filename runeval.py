@@ -1,10 +1,19 @@
+"""Play a trained checkpoint against bots and other checkpoints.
+
+    python runeval.py checkpoints/iter_0199.pt --trading --seats this checkpoints/iter_0100.pt value value
+
+--seats takes one entry per seat: "this" (the checkpoint), a bot name (random,
+weighted, victory_point, value), or the path of another checkpoint trained with
+the same settings. Without it: this random random random.
+Each checkpoint holds one network per seat, so seat k is played by network k.
+"""
 import argparse
 import dataclasses
-import itertools
+import pathlib
 import torch
 from torchrl.modules import MultiAgentMLP
 from catan_env import CatanConfig, CatanCore
-from evaluate import make_policy, play_match
+from evaluate import BOTS, make_policy, play_match
 
 CONFIG = CatanConfig(num_players=4, map_type="BASE", vps_to_win=8)
 
@@ -31,9 +40,10 @@ def load_policy_net(path, core):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("checkpoint")
+    parser.add_argument("--seats", nargs="+", default=["this", "random", "random", "random"])
     parser.add_argument("--games", type=int, default=100)
     parser.add_argument("--seed", type=int, default=0)
-    # These two must match the CatanConfig the checkpoint was trained with.
+    # These two must match the CatanConfig the checkpoints were trained with.
     parser.add_argument("--trading", action="store_true")
     parser.add_argument("--max-offers", type=int, default=CONFIG.max_offers_per_turn)
     args = parser.parse_args()
@@ -41,24 +51,22 @@ def main():
     config = dataclasses.replace(CONFIG, trading=args.trading, max_offers_per_turn=args.max_offers)
     core = CatanCore(config)
     n = core.n_agents
-    net, iteration = load_policy_net(args.checkpoint, core)
-    print(f"{args.checkpoint} (iteration {iteration}), {args.games} games per match")
+    if len(args.seats) != n:
+        raise SystemExit(f"--seats needs {n} entries, one per seat; got {len(args.seats)}")
 
-    print("1) one network vs 3 random bots")
-    for k in range(n):
-        seats = ["random"] * n
-        seats[k] = make_policy(net, k, n)
-        r = play_match(seats, args.games, config, seed=args.seed)
-        bots = sum(r.win_rates[i] for i in range(n) if i != k)
-        print(f"   network {k}: win rate {r.win_rates[k]:.2f} , three bots together {bots:.2f}")
+    nets, seats = {}, []
+    for k, who in enumerate(args.seats):
+        if who in BOTS:
+            seats.append(who)
+            continue
+        path = args.checkpoint if who == "this" else who
+        if path not in nets:
+            nets[path], iteration = load_policy_net(path, core)
+            print(f"{path} (iteration {iteration})")
+        seats.append(make_policy(nets[path], k, n))
 
-    print("2) two networks vs 2 random bots")
-    for a, b in itertools.combinations(range(n), 2):
-        seats = ["random"] * n
-        seats[a], seats[b] = make_policy(net, a, n), make_policy(net, b, n)
-        r = play_match(seats, args.games, config, seed=args.seed)
-        bots = sum(r.win_rates[i] for i in range(n) if i not in (a, b))
-        print(f"   network {a} {r.win_rates[a]:.2f}, network {b} {r.win_rates[b]:.2f}, both bots together {bots:.2f}")
+    labels = [pathlib.Path(who).stem[:13] for who in args.seats]
+    print(play_match(seats, args.games, config, seed=args.seed, labels=labels).table())
 
 if __name__ == "__main__":
     main()
