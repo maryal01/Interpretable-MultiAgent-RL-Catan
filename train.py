@@ -26,9 +26,12 @@ torch.manual_seed(0)
 from tqdm import tqdm
 
 from catan_env import CatanConfig, CatanEnv
-from rewardfn import InitialRewardFunction
+#from rewardfn import InitialRewardFunction
 
-def train():
+from rewardfn import make_reward_fn
+
+
+def train(n_iters=200, frames_per_batch=6_000, ckpt_dir="checkpoints", reward="simple", trading=True):
     is_fork = multiprocessing.get_start_method() == "fork"
     device = (
         torch.device(0)
@@ -37,13 +40,11 @@ def train():
     )
 
     # Sampling
-    frames_per_batch = 6_000  # Number of team frames collected per training iteration
-    n_iters = 200  # Number of sampling and training iterations
     total_frames = frames_per_batch * n_iters
 
     # Training
     num_epochs = 10  # Number of optimization steps per training iteration
-    minibatch_size = 400  # Size of the mini-batches in each optimization step
+    minibatch_size = min(400, frames_per_batch)  # Size of the mini-batches in each optimization step
     lr = 3e-4  # Learning rate
     max_grad_norm = 1.0  # Maximum norm for the gradients
 
@@ -63,10 +64,13 @@ def train():
             num_players = 4,
             map_type = "BASE",
             vps_to_win = 8,
-            trading = True),
+            trading = trading),
         seed = 0,
         device = device,
-        reward_fn = InitialRewardFunction(trade_weight = 0.02))  # 0 = no reward for trades
+        #reward_fn = InitialRewardFunction(trade_weight = 0.02))  # 0 = no reward for trades
+        reward_fn = make_reward_fn(reward)                         # "simple" or "initial"
+        #reward_fn = make_reward_fn("initial", trade_weight=0.05)   # keyword args go to the class
+    )   
     check_env_specs(env)
 
     env = TransformedEnv(
@@ -166,8 +170,7 @@ def train():
 
     pbar = tqdm(total=n_iters)
 
-    if not os.path.exists('checkpoints'):
-      os.makedirs('checkpoints')
+    os.makedirs(ckpt_dir, exist_ok=True)
     torch.save(
         {
             "iteration": -1,
@@ -175,7 +178,7 @@ def train():
             "critic": critic_net.state_dict(),
             "optimizer": optim.state_dict(),
         }, 
-        f"checkpoints/iter_before_training.pt")
+        f"{ckpt_dir}/iter_before_training.pt")
     
     for i_episode, tensordict_data in enumerate(collector):
         with torch.no_grad():
@@ -212,8 +215,20 @@ def train():
                 "policy": policy_net.state_dict(),
                 "critic": critic_net.state_dict(),
                 "optimizer": optim.state_dict(),
-            }, f"checkpoints/iter_{i_episode:04d}.pt")
+            }, f"{ckpt_dir}/iter_{i_episode:04d}.pt")
+        done = tensordict_data.get(("next", "agents", "done"))
+        ep_rew = tensordict_data.get(("next", "agents", "episode_reward"))[done]
+        if ep_rew.numel():
+            pbar.set_description(f"episode_reward_mean={ep_rew.mean().item():.3f}")
         pbar.update()
 
 if __name__ == "__main__":
-    train()
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--iters", type=int, default=200)
+    p.add_argument("--frames", type=int, default=6_000)
+    p.add_argument("--ckpt-dir", default="checkpoints")
+    p.add_argument("--reward", default="simple")
+    p.add_argument("--trading", action=argparse.BooleanOptionalAction, default=True)
+    a = p.parse_args()
+    train(n_iters=a.iters, frames_per_batch=a.frames, ckpt_dir=a.ckpt_dir, reward=a.reward, trading=a.trading)
