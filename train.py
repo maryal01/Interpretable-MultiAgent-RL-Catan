@@ -31,7 +31,8 @@ from catan_env import CatanConfig, CatanEnv
 from rewardfn import make_reward_fn
 
 
-def train(n_iters=200, frames_per_batch=6_000, ckpt_dir="checkpoints", reward="simple", trading=True):
+def train(n_iters=200, frames_per_batch=6_000, ckpt_dir="checkpoints", reward="simple", trading=True, seed=0):
+    torch.manual_seed(seed)  # network weights and action sampling
     is_fork = multiprocessing.get_start_method() == "fork"
     device = (
         torch.device(0)
@@ -65,7 +66,7 @@ def train(n_iters=200, frames_per_batch=6_000, ckpt_dir="checkpoints", reward="s
             map_type = "BASE",
             vps_to_win = 8,
             trading = trading),
-        seed = 0,
+        seed = seed,  # maps, turn order and dice
         device = device,
         #reward_fn = InitialRewardFunction(trade_weight = 0.02))  # 0 = no reward for trades
         reward_fn = make_reward_fn(reward)                         # "simple" or "initial"
@@ -230,5 +231,6 @@ if __name__ == "__main__":
     p.add_argument("--ckpt-dir", default="checkpoints")
     p.add_argument("--reward", default="simple")
     p.add_argument("--trading", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--seed", type=int, default=0)
     a = p.parse_args()
-    train(n_iters=a.iters, frames_per_batch=a.frames, ckpt_dir=a.ckpt_dir, reward=a.reward, trading=a.trading)
+    train(n_iters=a.iters, frames_per_batch=a.frames, ckpt_dir=a.ckpt_dir, reward=a.reward, trading=a.trading, seed=a.seed)

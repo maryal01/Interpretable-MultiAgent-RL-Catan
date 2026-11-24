@@ -2,7 +2,6 @@
 logs/
 .venv/
 venv/
-checkpoints/
 env/
 __pycache__/
 *.py[cod]
