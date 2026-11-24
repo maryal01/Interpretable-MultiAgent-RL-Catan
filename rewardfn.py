@@ -87,11 +87,12 @@ class InitialRewardFunction:
 
 
 class SimpleCatanReward:
-    def __init__(self, vp_weight=0.1, win=1.0, loss=-1.0, truncation=-1.2):
+    def __init__(self, vp_weight=0.1, win=1.0, loss=-1.0, truncation=-1.2, trade_weight=0.0):
         self.vp_weight = vp_weight
         self.loss_reward = loss
         self.win_reward = win
         self.truncation_reward = truncation     # paid when the turn limit is hit
+        self.trade_weight = trade_weight        # times each trader's utility gain; 0 = no trade reward
 
     def points(self, game, color):              # VP counted rule by rule, no VP cards
         state = game.state
@@ -114,6 +115,12 @@ class SimpleCatanReward:
             current = self.points(game, color)
             rewards[i] = self.vp_weight * (current - self.prev_vp[color])
             self.prev_vp[color] = current
+
+        if self.trade_weight and game.state.action_records:
+            action = game.state.action_records[-1].action
+            if action.action_type == ActionType.CONFIRM_TRADE:
+                for color, gain in trade_gains(game, action).items():
+                    rewards[core.colors.index(color)] += self.trade_weight * gain
 
         terminated, truncated = core.status(game)
         if (terminated or truncated) and not self.finished:

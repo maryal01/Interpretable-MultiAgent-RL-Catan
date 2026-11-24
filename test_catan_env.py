@@ -11,7 +11,7 @@ from catanatron.models.enums import ActionType
 from catan_env import (ACTION, ACTION_MASK, ACTIVE, OBS, REWARD, CatanConfig, CatanCore, IllegalActionError,
                        _masked_random_policy, make_env)
 from evaluate import play_match, random_policy
-from rewardfn import InitialRewardFunction
+from rewardfn import make_reward_fn
 
 CONFIGS = [CatanConfig(num_players=3), CatanConfig(num_players=4), CatanConfig(num_players=4, map_type="BASE",
                                                                                 vps_to_win=10, turn_limit=1000)]
@@ -139,6 +139,16 @@ def test_illegal_action_in_env_raises():
         env.step(td.set(ACTION, torch.full((4,), illegal)))
 
 
+def test_bots_play_inside_step():
+    env = make_env(seed=3, bots=("weighted",), trading=True)
+    check_env_specs(env)
+    td = env.rollout(3000, policy=_masked_random_policy(), break_when_any_done=True)
+    bot = next(iter(env.bot_players))
+    assert not td[ACTIVE][:, bot].any() and (td[ACTIVE].sum(-1) == 1).all()
+    colors = {r.action.color for r in env.game.state.action_records}
+    assert env.core.colors[bot] in colors and td["next", "done"][-1].all()
+
+
 def test_auto_reset_and_multiprocess_collector():
     env = make_env(seed=2)
     td = env.rollout(2500, policy=_masked_random_policy(), break_when_any_done=False)
@@ -177,10 +187,11 @@ def test_illegal_policy_is_caught():
 
 
 # ------------------------------------------------------------------ reward
-def test_trade_reward_only_pays_the_two_traders():
-    reward_fn = InitialRewardFunction(vp_weight=0, win=0, loss=0, trade_weight=1.0)  # trade part only
+@pytest.mark.parametrize("name, kwargs", [("initial", {}), ("simple", {"truncation": 0})])
+def test_trade_reward_only_pays_the_two_traders(name, kwargs):
+    reward_fn = make_reward_fn(name, vp_weight=0, win=0, loss=0, trade_weight=1.0, **kwargs)  # trade part only
     core = CatanCore(CatanConfig(trading=True), reward_fn=reward_fn)
-    rng, game, trades = np.random.default_rng(0), core.new_game(0), 0
+    rng, game, trades, paid = np.random.default_rng(0), core.new_game(0), 0, False
     while not core.is_over(game):
         action = core.apply(game, core.current_agent(game), int(rng.choice(core.legal_indices(game))))
         rewards = core.rewards(game)
@@ -189,6 +200,7 @@ def test_trade_reward_only_pays_the_two_traders():
             others = [i for i in range(core.n_agents) if i not in traders]
             assert not rewards[others].any()
             trades += 1
+            paid |= bool(rewards[traders].any())
         else:
             assert not rewards.any()
-    assert trades > 0
+    assert trades > 0 and paid

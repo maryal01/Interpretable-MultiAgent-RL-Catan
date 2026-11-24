@@ -19,27 +19,14 @@ from dataclasses import dataclass
 from typing import Callable, Optional, Sequence
 import torch
 import numpy as np
-from catanatron.models.player import Player, RandomPlayer
-from catanatron.players.minimax import AlphaBetaPlayer
-from catanatron.players.search import VictoryPointPlayer
-from catanatron.players.value import ValueFunctionPlayer
-from catanatron.players.weighted_random import WeightedRandomPlayer
+from catanatron.models.player import Player
 from catanatron.models.enums import ActionType
 from catanatron.state_functions import get_actual_victory_points, get_player_freqdeck
 
-from catan_env import CatanConfig, CatanCore, IllegalActionError, RobberStats, TradeStats
+from catan_env import BOTS, CatanConfig, CatanCore, IllegalActionError, RobberStats, TradeStats
 from rewardfn import BUILDS, build_limits, hand_utility
 
 Policy = Callable[[np.ndarray, np.ndarray], int]
-
-# Roughly weakest to strongest. AlphaBeta searches game trees and is much slower.
-BOTS = {
-    "random": RandomPlayer,
-    "weighted": WeightedRandomPlayer,
-    "victory_point": VictoryPointPlayer,
-    "value": ValueFunctionPlayer,
-    "alphabeta": AlphaBetaPlayer,
-}
 
 def random_policy(seed: Optional[int] = None) -> Policy:
     rng = np.random.default_rng(seed)

@@ -21,6 +21,9 @@ Design notes
     shuffles turn order every game.
   * Robber victims are encoded relative to the actor ("rob the next player"),
     so an action index means the same thing whichever seat an agent is in.
+  * ``CatanEnv(bots=("value",))`` puts Catanatron bots at the table: each game they
+    take random seats and play their moves inside ``env.step``; the other seats
+    are agents. A bot seat is never active, so it adds no training data.
   * Parallelise with a multi-process ``Collector`` (one env per worker), not
     ``ParallelEnv``, which syncs every step and was slower than one process.
 
@@ -49,7 +52,7 @@ import operator
 import random
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Iterable, Optional, Protocol
+from typing import Iterable, Optional, Protocol, Sequence
 
 import numpy as np
 import torch
@@ -62,7 +65,11 @@ from catanatron.game import Game
 from catanatron.gym.envs.action_space import get_action_array
 from catanatron.models.enums import RESOURCES, Action, ActionPrompt, ActionType
 from catanatron.models.map import build_map
-from catanatron.models.player import Color, Player
+from catanatron.models.player import Color, Player, RandomPlayer
+from catanatron.players.minimax import AlphaBetaPlayer
+from catanatron.players.search import VictoryPointPlayer
+from catanatron.players.value import ValueFunctionPlayer
+from catanatron.players.weighted_random import WeightedRandomPlayer
 from catanatron.observer import GameObserver
 from catanatron.state_functions import get_player_freqdeck, get_visible_victory_points, player_has_rolled
 
@@ -76,6 +83,14 @@ DONE = (GROUP, "done")
 
 ALL_COLORS = (Color.RED, Color.BLUE, Color.ORANGE, Color.WHITE)
 
+# Catanatron's bots, roughly weakest to strongest. AlphaBeta searches game trees and is much slower.
+BOTS = {
+    "random": RandomPlayer,
+    "weighted": WeightedRandomPlayer,
+    "victory_point": VictoryPointPlayer,
+    "value": ValueFunctionPlayer,
+    "alphabeta": AlphaBetaPlayer,
+}
 
 class IllegalActionError(ValueError):
     pass
@@ -418,11 +433,22 @@ class TradeStats(GameObserver):
 # --------------------------------------------------------------------- env
 class CatanEnv(EnvBase):
     def __init__(self, config: CatanConfig = CatanConfig(), reward_fn: Optional[RewardFn] = None,
-                 seed: Optional[int] = None, device="cpu", update_spec_mask: bool = True):
+                 seed: Optional[int] = None, device="cpu", update_spec_mask: bool = True,
+                 bots: Sequence[str] = ()):
         """update_spec_mask: keep the action spec's mask in sync with legal moves so
-        env.rand_action() / env.rollout() without a policy stay legal."""
+        env.rand_action() / env.rollout() without a policy stay legal.
+        bots: names from BOTS that join every game at random seats (fewer than num_players)."""
         super().__init__(device=device, batch_size=torch.Size([]))
         self.core = CatanCore(config, reward_fn)
+        for b in bots:
+            if b not in BOTS:
+                raise ValueError(f"unknown bot {b!r}; choose from {sorted(BOTS)}")
+        if len(bots) >= self.core.n_agents:
+            raise ValueError("bots must leave at least one seat for an agent")
+        if config.trading and "alphabeta" in bots:
+            raise ValueError("alphabeta cannot answer trade offers; choose another bot when trading is on")
+        self.bots = tuple(bots)
+        self.bot_players: dict = {}  # agent index -> Catanatron Player, for the current game
         self.group_map = {GROUP: [f"player_{i}" for i in range(self.core.n_agents)]}
         self.update_spec_mask = update_spec_mask
         self._rng = np.random.default_rng(seed)
@@ -481,14 +507,30 @@ class CatanEnv(EnvBase):
 
     def _reset(self, tensordict: Optional[TensorDictBase] = None, **kwargs) -> TensorDict:
         self.last_game_seed = int(self._rng.integers(2**31 - 1))
-        self.game = self.core.new_game(self.last_game_seed)
+        colors = self.core.colors
+        seats = self._rng.choice(len(colors), size=len(self.bots), replace=False) if self.bots else []
+        self.bot_players = {int(s): BOTS[b](colors[s]) for s, b in zip(seats, self.bots)}
+        players = [self.bot_players.get(i) or Player(c) for i, c in enumerate(colors)]
+        self.game = self.core.new_game(self.last_game_seed, players=players)
         self.stats.before(self.game)
         self.trade_stats.before(self.game)
+        self._play_bots()
         return self._observe(False, False)
+
+    def _play_bots(self) -> None:
+        """Play bot moves until an agent has to act or the game ends."""
+        game, core = self.game, self.core
+        while not core.is_over(game) and core.current_agent(game) in self.bot_players:
+            action = self.bot_players[core.current_agent(game)].decide(game, game.playable_actions)
+            for observer in (self.stats, self.trade_stats):
+                observer.step(game, action)
+            game.execute(action)
+            core.skip_forced_rejects(game)
 
     def _step(self, tensordict: TensorDictBase) -> TensorDict:
         agent = self.core.current_agent(self.game)
         self.core.apply(self.game, agent, int(tensordict.get(ACTION)[agent]), observers=(self.stats, self.trade_stats))
+        self._play_bots()
         terminated, truncated = self.core.status(self.game)
         if terminated or truncated:
             self.last_episode_stats = self.stats.summary()
@@ -501,9 +543,10 @@ class CatanEnv(EnvBase):
         self._rng = np.random.default_rng(seed)
 
 
-def make_env(seed: Optional[int] = None, reward_fn: Optional[RewardFn] = None, **config) -> CatanEnv:
+def make_env(seed: Optional[int] = None, reward_fn: Optional[RewardFn] = None, bots: Sequence[str] = (),
+             **config) -> CatanEnv:
     """Picklable factory for collectors: functools.partial(make_env, seed=s, num_players=4)."""
-    return CatanEnv(CatanConfig(**config), reward_fn=reward_fn, seed=seed)
+    return CatanEnv(CatanConfig(**config), reward_fn=reward_fn, seed=seed, bots=bots)
 
 
 # --------------------------------------------------------------- benchmark

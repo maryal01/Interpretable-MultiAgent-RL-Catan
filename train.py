@@ -31,7 +31,8 @@ from catan_env import CatanConfig, CatanEnv
 from rewardfn import make_reward_fn
 
 
-def train(n_iters=200, frames_per_batch=6_000, ckpt_dir="checkpoints", reward="simple", trading=True, seed=0):
+def train(n_iters=200, frames_per_batch=6_000, ckpt_dir="checkpoints", reward="simple", trading=True, seed=0,
+          bots=(), lr_decay=True, trade_weight=0.0):
     torch.manual_seed(seed)  # network weights and action sampling
     is_fork = multiprocessing.get_start_method() == "fork"
     device = (
@@ -55,7 +56,7 @@ def train(n_iters=200, frames_per_batch=6_000, ckpt_dir="checkpoints", reward="s
     lmbda = 0.9  # lambda for generalised advantage estimation
     entropy_eps = 0.01 # coefficient of the entropy term in the PPO loss
 
-    save_interval = 10
+    save_interval = 100  # saves iter_0100, iter_0200, ... and the last iteration
 
     # disable log-prob aggregation
     set_composite_lp_aggregate(False).set()
@@ -67,10 +68,10 @@ def train(n_iters=200, frames_per_batch=6_000, ckpt_dir="checkpoints", reward="s
             vps_to_win = 8,
             trading = trading),
         seed = seed,  # maps, turn order and dice
+        bots = bots,  # e.g. ("value",): Catanatron bots at random seats in every game
         device = device,
         #reward_fn = InitialRewardFunction(trade_weight = 0.02))  # 0 = no reward for trades
-        reward_fn = make_reward_fn(reward)                         # "simple" or "initial"
-        #reward_fn = make_reward_fn("initial", trade_weight=0.05)   # keyword args go to the class
+        reward_fn = make_reward_fn(reward, trade_weight=trade_weight)  # "simple" or "initial"
     )   
     check_env_specs(env)
 
@@ -168,6 +169,8 @@ def train(n_iters=200, frames_per_batch=6_000, ckpt_dir="checkpoints", reward="s
 
     GAE = loss_module.value_estimator
     optim = torch.optim.Adam(loss_module.parameters(), lr)
+    # lr falls linearly from lr to 0 over training (constant if lr_decay=False)
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optim, lambda i: 1 - i / n_iters if lr_decay else 1.0)
 
     pbar = tqdm(total=n_iters)
 
@@ -208,14 +211,17 @@ def train(n_iters=200, frames_per_batch=6_000, ckpt_dir="checkpoints", reward="s
                 optim.zero_grad()
 
         collector.update_policy_weights_()
+        scheduler.step()
 
         # Save the model
-        if i_episode % save_interval == 0 or i_episode == n_iters - 1:            
+        if (i_episode > 0 and i_episode % save_interval == 0) or i_episode == n_iters - 1:
             torch.save({
                 "iteration": i_episode,
                 "policy": policy_net.state_dict(),
                 "critic": critic_net.state_dict(),
                 "optimizer": optim.state_dict(),
+                "bots": list(bots),
+                "trade_weight": trade_weight,
             }, f"{ckpt_dir}/iter_{i_episode:04d}.pt")
         done = tensordict_data.get(("next", "agents", "done"))
         ep_rew = tensordict_data.get(("next", "agents", "episode_reward"))[done]
@@ -232,5 +238,9 @@ if __name__ == "__main__":
     p.add_argument("--reward", default="simple")
     p.add_argument("--trading", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--bots", nargs="*", default=[], help="bots joining every training game, e.g. --bots value")
+    p.add_argument("--lr-decay", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--trade-weight", type=float, default=0.0, help="reward per unit of hand utility gained in a trade")
     a = p.parse_args()
-    train(n_iters=a.iters, frames_per_batch=a.frames, ckpt_dir=a.ckpt_dir, reward=a.reward, trading=a.trading, seed=a.seed)
+    train(n_iters=a.iters, frames_per_batch=a.frames, ckpt_dir=a.ckpt_dir, reward=a.reward, trading=a.trading, seed=a.seed,
+          bots=a.bots, lr_decay=a.lr_decay, trade_weight=a.trade_weight)
