@@ -44,6 +44,20 @@ def infer_dims(checkpoint_path: str) -> tuple[int, int]:
     return obs_dim, n_actions
 
 
+# ------------------------------------------------------------------ config
+CONFIG = CatanConfig(num_players=N_AGENTS, map_type="BASE", vps_to_win=8)
+
+
+def config_for(obs_dim: int, n_actions: int) -> CatanConfig:
+    """Pick trading on/off so the env's shapes match the checkpoint."""
+    for trading in (False, True):
+        cfg = CatanConfig(num_players=N_AGENTS, map_type="BASE", vps_to_win=8, trading=trading)
+        core = CatanCore(cfg)
+        if len(core.feature_names) == obs_dim and len(core.action_table) == n_actions:
+            return cfg
+    raise ValueError(f"no CatanConfig matches obs_dim={obs_dim}, n_actions={n_actions}")
+
+
 # ------------------------------------------------------------------ load policy
 def load_policy(checkpoint_path: str) -> tuple:
     set_composite_lp_aggregate(False).set()
@@ -51,8 +65,10 @@ def load_policy(checkpoint_path: str) -> tuple:
     obs_dim, n_actions = infer_dims(checkpoint_path)
     print(f"Inferred obs_dim: {obs_dim}, n_actions: {n_actions}")
 
-    config = CatanConfig(num_players=N_AGENTS, map_type="BASE", vps_to_win=8)
-    env = make_env(seed=0, **vars(config))
+    global CONFIG
+    CONFIG = config_for(obs_dim, n_actions)
+    print(f"Env config: trading={CONFIG.trading}")
+    env = make_env(seed=0, **vars(CONFIG))
 
     policy_net = MultiAgentMLP(
         n_agent_inputs=obs_dim,
@@ -173,7 +189,7 @@ def collect_decisions(
 
 # ------------------------------------------------------------------ feature names
 def get_feature_names(obs_dim: int) -> list[str]:
-    core = CatanCore(CatanConfig(num_players=N_AGENTS, map_type="BASE", vps_to_win=8))
+    core = CatanCore(CONFIG)
     names = list(core.feature_names)
     if len(names) < obs_dim:
         names += [f"feature_{i}" for i in range(len(names), obs_dim)]
@@ -267,7 +283,7 @@ def print_analysis(
     for rank, i in enumerate(top_idx, 1):
         print(f"  {rank}. {feature_names[i]:<55s}  {importances[i]:.4f}")
 
-    core = CatanCore(CatanConfig(num_players=N_AGENTS, map_type="BASE", vps_to_win=8))
+    core = CatanCore(CONFIG)
     print(f"\nTop 5 most frequent greedy actions:")
     for act_idx, count in Counter(actions).most_common(5):
         print(f"  {action_name(int(act_idx), core):<55s}  {count} ({count/len(actions):.1%})")
@@ -312,7 +328,7 @@ def main():
     policy_module = policy.module[0]
 
     feature_names = get_feature_names(obs_dim)
-    core = CatanCore(CatanConfig(num_players=N_AGENTS, map_type="BASE", vps_to_win=8))
+    core = CatanCore(CONFIG)
     agents_to_distill = [args.agent] if args.agent is not None else list(range(N_AGENTS))
 
     for agent_idx in agents_to_distill:
